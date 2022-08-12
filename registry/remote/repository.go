@@ -23,9 +23,11 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/opencontainers/distribution-spec/specs-go/v1/extensions"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	artifactspec "github.com/oras-project/artifacts-spec/specs-go/v1"
@@ -38,6 +40,10 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/internal/errutil"
 )
+
+// referrersApiRegex checks referrers API version.
+// Reference: https://github.com/oras-project/artifacts-spec/blob/main/manifest-referrers-api.md#versioning
+var referrersApiRegex = regexp.MustCompile(`^oras/1\.(0|[1-9]\d*)$`)
 
 // Client is an interface for a HTTP client.
 type Client interface {
@@ -244,6 +250,25 @@ func (r *Repository) FetchReference(ctx context.Context, reference string) (ocis
 	return r.Manifests().FetchReference(ctx, reference)
 }
 
+// TagReference retags the manifest identified by src to dst.
+func (r *Repository) TagReference(ctx context.Context, src, dst string) error {
+	srcRef, err := r.parseReference(src)
+	if err != nil {
+		return err
+	}
+	dstRef, err := r.parseReference(dst)
+	if err != nil {
+		return err
+	}
+	ctx = withScopeHint(ctx, srcRef, auth.ActionPull, auth.ActionPush)
+	manifestDesc, rc, err := r.FetchReference(ctx, src)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	return r.push(ctx, manifestDesc, rc, dstRef.Reference)
+}
+
 // parseReference validates the reference.
 // Both simplified or fully qualified references are accepted as input.
 // A fully qualified reference is returned on success.
@@ -272,12 +297,21 @@ func (r *Repository) parseReference(reference string) (registry.Reference, error
 }
 
 // Tags lists the tags available in the repository.
-func (r *Repository) Tags(ctx context.Context, fn func(tags []string) error) error {
+// See also `TagListPageSize`.
+// If `last` is NOT empty, the entries in the response start after the
+// tag specified by `last`. Otherwise, the response starts from the top
+// of the Tags list.
+// References:
+// - https://github.com/opencontainers/distribution-spec/blob/main/spec.md#content-discovery
+// - https://docs.docker.com/registry/spec/api/#tags
+func (r *Repository) Tags(ctx context.Context, last string, fn func(tags []string) error) error {
 	ctx = withScopeHint(ctx, r.Reference, auth.ActionPull)
 	url := buildRepositoryTagListURL(r.PlainHTTP, r.Reference)
 	var err error
 	for err == nil {
-		url, err = r.tags(ctx, fn, url)
+		url, err = r.tags(ctx, last, fn, url)
+		// clear `last` for subsequent pages
+		last = ""
 	}
 	if err != errNoLink {
 		return err
@@ -286,17 +320,21 @@ func (r *Repository) Tags(ctx context.Context, fn func(tags []string) error) err
 }
 
 // tags returns a single page of tag list with the next link.
-func (r *Repository) tags(ctx context.Context, fn func(tags []string) error, url string) (string, error) {
+func (r *Repository) tags(ctx context.Context, last string, fn func(tags []string) error, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
-	if r.TagListPageSize > 0 {
+	if r.TagListPageSize > 0 || last != "" {
 		q := req.URL.Query()
-		q.Set("n", strconv.Itoa(r.TagListPageSize))
+		if r.TagListPageSize > 0 {
+			q.Set("n", strconv.Itoa(r.TagListPageSize))
+		}
+		if last != "" {
+			q.Set("last", last)
+		}
 		req.URL.RawQuery = q.Encode()
 	}
-
 	resp, err := r.client().Do(req)
 	if err != nil {
 		return "", err
@@ -327,7 +365,7 @@ func (r *Repository) tags(ctx context.Context, fn func(tags []string) error, url
 // Reference: https://github.com/oras-project/artifacts-spec/blob/main/manifest-referrers-api.md
 func (r *Repository) Predecessors(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 	var res []ocispec.Descriptor
-	if err := r.Referrers(ctx, desc, func(referrers []artifactspec.Descriptor) error {
+	if err := r.Referrers(ctx, desc, "", func(referrers []artifactspec.Descriptor) error {
 		for _, referrer := range referrers {
 			res = append(res, descriptor.ArtifactToOCI(referrer))
 		}
@@ -339,17 +377,28 @@ func (r *Repository) Predecessors(ctx context.Context, desc ocispec.Descriptor) 
 }
 
 // Referrers lists the descriptors of ORAS Artifact manifests directly
-// referencing the given manifest descriptor.
+// referencing the given manifest descriptor. fn is called for each page of
+// the referrers result. If artifactType is not empty, only referrers of the
+// same artifact type are fed to fn.
 // Reference: https://github.com/oras-project/artifacts-spec/blob/main/manifest-referrers-api.md
-func (r *Repository) Referrers(ctx context.Context, desc ocispec.Descriptor, fn func(referrers []artifactspec.Descriptor) error) error {
-	// TODO(shizhMSFT): filter artifact type
+func (r *Repository) Referrers(ctx context.Context, desc ocispec.Descriptor, artifactType string, fn func(referrers []artifactspec.Descriptor) error) error {
 	ref := r.Reference
 	ref.Reference = desc.Digest.String()
 	ctx = withScopeHint(ctx, ref, auth.ActionPull)
-	url := buildArtifactReferrerURL(r.PlainHTTP, ref)
+	url := buildArtifactReferrerURL(r.PlainHTTP, ref, artifactType)
 	var err error
+
+	var legacyAPI bool
+	url, err = r.referrers(ctx, artifactType, fn, url, legacyAPI)
+	// Fallback to legacy url
+	if errors.Is(err, errdef.ErrNotFound) {
+		url = buildArtifactReferrerURLLegacy(r.PlainHTTP, ref, artifactType)
+		legacyAPI = true
+		err = nil
+	}
+
 	for err == nil {
-		url, err = r.referrers(ctx, desc, fn, url)
+		url, err = r.referrers(ctx, artifactType, fn, url, legacyAPI)
 	}
 	if err != errNoLink {
 		return err
@@ -359,7 +408,7 @@ func (r *Repository) Referrers(ctx context.Context, desc ocispec.Descriptor, fn 
 
 // referrers returns a single page of the manifest descriptors directly
 // referencing the given manifest descriptor with the next link.
-func (r *Repository) referrers(ctx context.Context, desc ocispec.Descriptor, fn func(referrers []artifactspec.Descriptor) error, url string) (string, error) {
+func (r *Repository) referrers(ctx context.Context, artifactType string, fn func(referrers []artifactspec.Descriptor) error, url string, legacyAPI bool) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -376,22 +425,85 @@ func (r *Repository) referrers(ctx context.Context, desc ocispec.Descriptor, fn 
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("%s %q: %w", resp.Request.Method, resp.Request.URL, errdef.ErrNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", errutil.ParseErrorResponse(resp)
+	}
+	if !legacyAPI {
+		if err := verifyOrasApiVersion(resp); err != nil {
+			return "", err
+		}
 	}
 
 	var page struct {
 		References []artifactspec.Descriptor `json:"references"`
+		Referrers  []artifactspec.Descriptor `json:"referrers"`
 	}
 	lr := limitReader(resp.Body, r.MaxMetadataBytes)
 	if err := json.NewDecoder(lr).Decode(&page); err != nil {
 		return "", fmt.Errorf("%s %q: failed to decode response: %w", resp.Request.Method, resp.Request.URL, err)
 	}
-	if err := fn(page.References); err != nil {
-		return "", err
+	var refs []artifactspec.Descriptor
+	if legacyAPI {
+		refs = page.References
+	} else {
+		refs = page.Referrers
+	}
+	// Server may not support filtering. We still need to filter on client side for sure.
+	refs = filterReferrers(refs, artifactType)
+	if len(refs) > 0 {
+		if err := fn(refs); err != nil {
+			return "", err
+		}
 	}
 
 	return parseLink(resp)
+}
+
+// filterReferrers filters a slice of referrers by artifactType in place.
+// The returned slice contains matching referrers.
+func filterReferrers(refs []artifactspec.Descriptor, artifactType string) []artifactspec.Descriptor {
+	if artifactType == "" {
+		return refs
+	}
+	var j int
+	for i, ref := range refs {
+		if ref.ArtifactType == artifactType {
+			if i != j {
+				refs[j] = ref
+			}
+			j++
+		}
+	}
+	return refs[:j]
+}
+
+// DiscoverExtensions lists all supported extensions in current repository.
+// Reference: https://github.com/oras-project/artifacts-spec/blob/main/manifest-referrers-api.md#api-discovery
+func (r *Repository) DiscoverExtensions(ctx context.Context) ([]extensions.Extension, error) {
+	ctx = withScopeHint(ctx, r.Reference, auth.ActionPull)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, buildDiscoveryURL(r.PlainHTTP, r.Reference), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := r.client().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, errutil.ParseErrorResponse(resp)
+	}
+
+	var extensionList extensions.ExtensionList
+	lr := limitReader(resp.Body, r.MaxMetadataBytes)
+	if err := json.NewDecoder(lr).Decode(&extensionList); err != nil {
+		return nil, fmt.Errorf("%s %q: failed to decode response: %w", resp.Request.Method, resp.Request.URL, err)
+	}
+	return extensionList.Extensions, nil
 }
 
 // delete removes the content identified by the descriptor in the entity "blobs"
@@ -486,17 +598,6 @@ func (s *blobStore) Fetch(ctx context.Context, target ocispec.Descriptor) (rc io
 // - https://docs.docker.com/registry/spec/api/#initiate-blob-upload
 // - https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pushing-a-blob-monolithically
 func (s *blobStore) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
-	// if the underlying client is an auth client, the content might be read
-	// more than once for obtaining the auth challenge and the actual request.
-	// To prevent double reading, the auth token used in the first POST request
-	// should be cached for the second PUT request.
-	client := s.repo.client()
-	if c, ok := client.(*auth.Client); ok && c.Cache == nil {
-		snapshot := *c
-		snapshot.Cache = auth.NewCache()
-		client = &snapshot
-	}
-
 	// start an upload
 	// pushing usually requires both pull and push actions.
 	// Reference: https://github.com/distribution/distribution/blob/v2.7.1/registry/handlers/app.go#L921-L930
@@ -509,6 +610,7 @@ func (s *blobStore) Push(ctx context.Context, expected ocispec.Descriptor, conte
 	reqHostname := req.URL.Hostname()
 	reqPort := req.URL.Port()
 
+	client := s.repo.client()
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -552,6 +654,10 @@ func (s *blobStore) Push(ctx context.Context, expected ocispec.Descriptor, conte
 	q.Set("digest", expected.Digest.String())
 	req.URL.RawQuery = q.Encode()
 
+	// reuse credential from previous POST request
+	if auth := resp.Request.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
 	resp, err = client.Do(req)
 	if err != nil {
 		return err
@@ -892,6 +998,16 @@ func verifyContentDigest(resp *http.Response, expected digest.Digest) error {
 	}
 	if contentDigest != expected {
 		return fmt.Errorf("%s: mismatch digest: %s", expected, contentDigest)
+	}
+	return nil
+}
+
+// verifyOrasApiVersion verifies "ORAS-Api-Version" header if present.
+// Reference: https://github.com/oras-project/artifacts-spec/blob/main/manifest-referrers-api.md#versioning
+func verifyOrasApiVersion(resp *http.Response) error {
+	versionStr := resp.Header.Get("ORAS-Api-Version")
+	if !referrersApiRegex.MatchString(versionStr) {
+		return fmt.Errorf("%w: Unsupported ORAS-Api-Version: %q", errdef.ErrUnsupportedVersion, versionStr)
 	}
 	return nil
 }

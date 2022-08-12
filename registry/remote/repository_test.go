@@ -32,6 +32,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/opencontainers/distribution-spec/specs-go/v1/extensions"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	artifactspec "github.com/oras-project/artifacts-spec/specs-go/v1"
@@ -740,6 +741,99 @@ func TestRepository_FetchReference(t *testing.T) {
 	}
 }
 
+func TestRepository_TagReference(t *testing.T) {
+	index := []byte(`{"manifests":[]}`)
+	indexDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageIndex,
+		Digest:    digest.FromBytes(index),
+		Size:      int64(len(index)),
+	}
+	src := "foobar"
+	dst := "myTag"
+	var gotIndex []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && (r.URL.Path == "/v2/test/manifests/"+indexDesc.Digest.String() || r.URL.Path == "/v2/test/manifests/"+src):
+			if accept := r.Header.Get("Accept"); !strings.Contains(accept, indexDesc.MediaType) {
+				t.Errorf("manifest not convertable: %s", accept)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", indexDesc.MediaType)
+			w.Header().Set("Docker-Content-Digest", indexDesc.Digest.String())
+			if _, err := w.Write(index); err != nil {
+				t.Errorf("failed to write %q: %v", r.URL, err)
+			}
+		case r.Method == http.MethodPut && r.URL.Path == "/v2/test/manifests/"+dst:
+			if contentType := r.Header.Get("Content-Type"); contentType != indexDesc.MediaType {
+				w.WriteHeader(http.StatusBadRequest)
+				break
+			}
+			buf := bytes.NewBuffer(nil)
+			if _, err := buf.ReadFrom(r.Body); err != nil {
+				t.Errorf("fail to read: %v", err)
+			}
+			gotIndex = buf.Bytes()
+			w.Header().Set("Docker-Content-Digest", indexDesc.Digest.String())
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Errorf("unexpected access: %s %s", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+
+	repoName := uri.Host + "/test"
+	repo, err := NewRepository(repoName)
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repo.PlainHTTP = true
+	ctx := context.Background()
+
+	// test with manifest tag
+	err = repo.TagReference(ctx, src, dst)
+	if err != nil {
+		t.Fatalf("Repository.TagReference() error = %v", err)
+	}
+	if !bytes.Equal(gotIndex, index) {
+		t.Errorf("Repository.TagReference() = %v, want %v", gotIndex, index)
+	}
+
+	// test with manifest digest
+	err = repo.TagReference(ctx, indexDesc.Digest.String(), dst)
+	if err != nil {
+		t.Fatalf("Repository.TagReference() error = %v", err)
+	}
+	if !bytes.Equal(gotIndex, index) {
+		t.Errorf("Repository.TagReference() = %v, want %v", gotIndex, index)
+	}
+
+	// test with manifest tag@digest
+	tagDigestRef := src + "@" + indexDesc.Digest.String()
+	err = repo.TagReference(ctx, tagDigestRef, dst)
+	if err != nil {
+		t.Fatalf("Repository.TagReference() error = %v", err)
+	}
+	if !bytes.Equal(gotIndex, index) {
+		t.Errorf("Repository.TagReference() = %v, want %v", gotIndex, index)
+	}
+
+	// test with manifest FQDN
+	fqdnRef := repoName + ":" + tagDigestRef
+	err = repo.TagReference(ctx, fqdnRef, dst)
+	if err != nil {
+		t.Fatalf("Repository.TagReference() error = %v", err)
+	}
+	if !bytes.Equal(gotIndex, index) {
+		t.Errorf("Repository.TagReference() = %v, want %v", gotIndex, index)
+	}
+}
+
 func TestRepository_Tags(t *testing.T) {
 	tagSet := [][]string{
 		{"the", "quick", "brown", "fox"},
@@ -795,7 +889,7 @@ func TestRepository_Tags(t *testing.T) {
 
 	ctx := context.Background()
 	index := 0
-	if err := repo.Tags(ctx, func(got []string) error {
+	if err := repo.Tags(ctx, "", func(got []string) error {
 		if index > 2 {
 			t.Fatalf("out of index bound: %d", index)
 		}
@@ -857,7 +951,7 @@ func TestRepository_Predecessors(t *testing.T) {
 	}
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := "/oras/artifacts/v1/test/manifests/" + manifestDesc.Digest.String() + "/referrers"
+		path := "/v2/test/_oras/artifacts/referrers"
 		if r.Method != http.MethodGet || r.URL.Path != path {
 			t.Errorf("unexpected access: %s %s", r.Method, r.URL)
 			w.WriteHeader(http.StatusNotFound)
@@ -870,6 +964,7 @@ func TestRepository_Predecessors(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		w.Header().Set("ORAS-Api-Version", "oras/1.0")
 		var referrers []artifactspec.Descriptor
 		switch q.Get("test") {
 		case "foo":
@@ -878,13 +973,18 @@ func TestRepository_Predecessors(t *testing.T) {
 		case "bar":
 			referrers = referrerSet[2]
 		default:
+			if q.Get("digest") != manifestDesc.Digest.String() {
+				t.Errorf("digest not provided or mismatch: %s %q", r.Method, r.URL)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			referrers = referrerSet[0]
 			w.Header().Set("Link", fmt.Sprintf(`<%s?n=2&test=foo>; rel="next"`, path))
 		}
 		result := struct {
-			References []artifactspec.Descriptor `json:"references"`
+			Referrers []artifactspec.Descriptor `json:"referrers"`
 		}{
-			References: referrers,
+			Referrers: referrers,
 		}
 		if err := json.NewEncoder(w).Encode(result); err != nil {
 			t.Errorf("failed to write response: %v", err)
@@ -966,9 +1066,218 @@ func TestRepository_Referrers(t *testing.T) {
 	}
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := "/v2/test/_oras/artifacts/referrers"
+		if r.Method != http.MethodGet || r.URL.Path != path {
+			t.Errorf("unexpected access: %s %q", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		q := r.URL.Query()
+		n, err := strconv.Atoi(q.Get("n"))
+		if err != nil || n != 2 {
+			t.Errorf("bad page size: %s", q.Get("n"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("ORAS-Api-Version", "oras/1.0")
+		var referrers []artifactspec.Descriptor
+		switch q.Get("test") {
+		case "foo":
+			referrers = referrerSet[1]
+			w.Header().Set("Link", fmt.Sprintf(`<%s%s?n=2&test=bar>; rel="next"`, ts.URL, path))
+		case "bar":
+			referrers = referrerSet[2]
+		default:
+			if q.Get("digest") != manifestDesc.Digest.String() {
+				t.Errorf("digest not provided or mismatch: %s %q", r.Method, r.URL)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			referrers = referrerSet[0]
+			w.Header().Set("Link", fmt.Sprintf(`<%s?n=2&test=foo>; rel="next"`, path))
+		}
+		result := struct {
+			Referrers []artifactspec.Descriptor `json:"referrers"`
+		}{
+			Referrers: referrers,
+		}
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+
+	repo, err := NewRepository(uri.Host + "/test")
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repo.PlainHTTP = true
+	repo.ReferrerListPageSize = 2
+
+	ctx := context.Background()
+	index := 0
+	if err := repo.Referrers(ctx, manifestDesc, "", func(got []artifactspec.Descriptor) error {
+		if index >= len(referrerSet) {
+			t.Fatalf("out of index bound: %d", index)
+		}
+		referrers := referrerSet[index]
+		index++
+		if !reflect.DeepEqual(got, referrers) {
+			t.Errorf("Repository.Referrers() = %v, want %v", got, referrers)
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("Repository.Referrers() error = %v", err)
+	}
+}
+
+func TestRepository_Referrers_Incompatible(t *testing.T) {
+	manifest := []byte(`{"layers":[]}`)
+	manifestDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifest),
+		Size:      int64(len(manifest)),
+	}
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := "/v2/test/_oras/artifacts/referrers"
+		if r.Method != http.MethodGet || r.URL.Path != path {
+			t.Errorf("unexpected access: %s %q", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("ORAS-Api-Version", "oras/2.0")
+	}))
+	defer ts.Close()
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+
+	repo, err := NewRepository(uri.Host + "/test")
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repo.PlainHTTP = true
+
+	ctx := context.Background()
+	if err := repo.Referrers(ctx, manifestDesc, "", func(got []artifactspec.Descriptor) error {
+		return nil
+	}); err == nil {
+		t.Error("Repository.Referrers() incompatible version not rejected")
+	}
+}
+
+func Test_verifyOrasApiVersion(t *testing.T) {
+	params := []struct {
+		name       string
+		version    string
+		compatible bool
+	}{
+		{
+			name:       "exact",
+			version:    "oras/1.0",
+			compatible: true,
+		},
+		{
+			name:       "major same, minor different",
+			version:    "oras/1.11",
+			compatible: true,
+		},
+		{
+			name:       "major different",
+			version:    "oras/2.0",
+			compatible: false,
+		},
+		{
+			name:       "invalid prefix",
+			version:    "*oras/1.0",
+			compatible: false,
+		},
+		{
+			name:       "invalid minor version",
+			version:    "oras/1.01",
+			compatible: false,
+		},
+		{
+			name:       "not dot",
+			version:    "oras/1#0",
+			compatible: false,
+		},
+		{
+			name:       "no version",
+			version:    "",
+			compatible: false,
+		},
+	}
+
+	for _, tt := range params {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{Header: http.Header{}}
+			if tt.version != "" {
+				resp.Header.Set("ORAS-Api-Version", tt.version)
+			}
+			err := verifyOrasApiVersion(resp)
+			if (err == nil) != tt.compatible {
+				t.Errorf("verifyOrasApiVersion() compatible = %v, want = %v", err == nil, tt.compatible)
+			}
+		})
+	}
+}
+
+func TestRepository_Referrers_Fallback(t *testing.T) {
+	manifest := []byte(`{"layers":[]}`)
+	manifestDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifest),
+		Size:      int64(len(manifest)),
+	}
+	referrerSet := [][]artifactspec.Descriptor{
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         1,
+				Digest:       digest.FromString("1"),
+				ArtifactType: "application/vnd.test",
+			},
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         2,
+				Digest:       digest.FromString("2"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         3,
+				Digest:       digest.FromString("3"),
+				ArtifactType: "application/vnd.test",
+			},
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         4,
+				Digest:       digest.FromString("4"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         5,
+				Digest:       digest.FromString("5"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+	}
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := "/oras/artifacts/v1/test/manifests/" + manifestDesc.Digest.String() + "/referrers"
 		if r.Method != http.MethodGet || r.URL.Path != path {
-			t.Errorf("unexpected access: %s %s", r.Method, r.URL)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -1014,8 +1323,8 @@ func TestRepository_Referrers(t *testing.T) {
 
 	ctx := context.Background()
 	index := 0
-	if err := repo.Referrers(ctx, manifestDesc, func(got []artifactspec.Descriptor) error {
-		if index > 2 {
+	if err := repo.Referrers(ctx, manifestDesc, "", func(got []artifactspec.Descriptor) error {
+		if index >= len(referrerSet) {
 			t.Fatalf("out of index bound: %d", index)
 		}
 		referrers := referrerSet[index]
@@ -1026,6 +1335,392 @@ func TestRepository_Referrers(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Errorf("Repository.Referrers() error = %v", err)
+	}
+}
+
+func TestRepository_Referrers_ServerFiltering(t *testing.T) {
+	manifest := []byte(`{"layers":[]}`)
+	manifestDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifest),
+		Size:      int64(len(manifest)),
+	}
+	referrerSet := [][]artifactspec.Descriptor{
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         1,
+				Digest:       digest.FromString("1"),
+				ArtifactType: "application/vnd.test",
+			},
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         2,
+				Digest:       digest.FromString("2"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         3,
+				Digest:       digest.FromString("3"),
+				ArtifactType: "application/vnd.test",
+			},
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         4,
+				Digest:       digest.FromString("4"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         5,
+				Digest:       digest.FromString("5"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+	}
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := "/v2/test/_oras/artifacts/referrers"
+		if r.Method != http.MethodGet || r.URL.Path != path {
+			t.Errorf("unexpected access: %s %q", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		q := r.URL.Query()
+		n, err := strconv.Atoi(q.Get("n"))
+		if err != nil || n != 2 {
+			t.Errorf("bad page size: %s", q.Get("n"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("ORAS-Api-Version", "oras/1.0")
+		var referrers []artifactspec.Descriptor
+		switch q.Get("test") {
+		case "foo":
+			referrers = referrerSet[1]
+			w.Header().Set("Link", fmt.Sprintf(`<%s%s?n=2&test=bar>; rel="next"`, ts.URL, path))
+		case "bar":
+			referrers = referrerSet[2]
+		default:
+			if q.Get("digest") != manifestDesc.Digest.String() {
+				t.Errorf("digest not provided or mismatch: %s %q", r.Method, r.URL)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			referrers = referrerSet[0]
+			w.Header().Set("Link", fmt.Sprintf(`<%s?n=2&test=foo>; rel="next"`, path))
+		}
+		result := struct {
+			Referrers []artifactspec.Descriptor `json:"referrers"`
+		}{
+			Referrers: referrers,
+		}
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+
+	repo, err := NewRepository(uri.Host + "/test")
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repo.PlainHTTP = true
+	repo.ReferrerListPageSize = 2
+
+	ctx := context.Background()
+	index := 0
+	if err := repo.Referrers(ctx, manifestDesc, "application/vnd.test", func(got []artifactspec.Descriptor) error {
+		if index >= len(referrerSet) {
+			t.Fatalf("out of index bound: %d", index)
+		}
+		referrers := referrerSet[index]
+		index++
+		if !reflect.DeepEqual(got, referrers) {
+			t.Errorf("Repository.Referrers() = %v, want %v", got, referrers)
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("Repository.Referrers() error = %v", err)
+	}
+	if index != len(referrerSet) {
+		t.Errorf("fn invoked %d time(s), want %d", index, len(referrerSet))
+	}
+}
+
+func TestRepository_Referrers_ClientFiltering(t *testing.T) {
+	manifest := []byte(`{"layers":[]}`)
+	manifestDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifest),
+		Size:      int64(len(manifest)),
+	}
+	referrerSet := [][]artifactspec.Descriptor{
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         1,
+				Digest:       digest.FromString("1"),
+				ArtifactType: "application/vnd.test",
+			},
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         2,
+				Digest:       digest.FromString("2"),
+				ArtifactType: "application/vnd.foo",
+			},
+		},
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         3,
+				Digest:       digest.FromString("3"),
+				ArtifactType: "application/vnd.test",
+			},
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         4,
+				Digest:       digest.FromString("4"),
+				ArtifactType: "application/vnd.bar",
+			},
+		},
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         5,
+				Digest:       digest.FromString("5"),
+				ArtifactType: "application/vnd.baz",
+			},
+		},
+	}
+	filteredReferrerSet := [][]artifactspec.Descriptor{
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         1,
+				Digest:       digest.FromString("1"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+		{
+			{
+				MediaType:    artifactspec.MediaTypeArtifactManifest,
+				Size:         3,
+				Digest:       digest.FromString("3"),
+				ArtifactType: "application/vnd.test",
+			},
+		},
+	}
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := "/v2/test/_oras/artifacts/referrers"
+		if r.Method != http.MethodGet || r.URL.Path != path {
+			t.Errorf("unexpected access: %s %q", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		q := r.URL.Query()
+		n, err := strconv.Atoi(q.Get("n"))
+		if err != nil || n != 2 {
+			t.Errorf("bad page size: %s", q.Get("n"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("ORAS-Api-Version", "oras/1.0")
+		var referrers []artifactspec.Descriptor
+		switch q.Get("test") {
+		case "foo":
+			referrers = referrerSet[1]
+			w.Header().Set("Link", fmt.Sprintf(`<%s%s?n=2&test=bar>; rel="next"`, ts.URL, path))
+		case "bar":
+			referrers = referrerSet[2]
+		default:
+			if q.Get("digest") != manifestDesc.Digest.String() {
+				t.Errorf("digest not provided or mismatch: %s %q", r.Method, r.URL)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			referrers = referrerSet[0]
+			w.Header().Set("Link", fmt.Sprintf(`<%s?n=2&test=foo>; rel="next"`, path))
+		}
+		result := struct {
+			Referrers []artifactspec.Descriptor `json:"referrers"`
+		}{
+			Referrers: referrers,
+		}
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+
+	repo, err := NewRepository(uri.Host + "/test")
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repo.PlainHTTP = true
+	repo.ReferrerListPageSize = 2
+
+	ctx := context.Background()
+	index := 0
+	if err := repo.Referrers(ctx, manifestDesc, "application/vnd.test", func(got []artifactspec.Descriptor) error {
+		if index >= len(filteredReferrerSet) {
+			t.Fatalf("out of index bound: %d", index)
+		}
+		referrers := filteredReferrerSet[index]
+		index++
+		if !reflect.DeepEqual(got, referrers) {
+			t.Errorf("Repository.Referrers() = %v, want %v", got, referrers)
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("Repository.Referrers() error = %v", err)
+	}
+	if index != len(filteredReferrerSet) {
+		t.Errorf("fn invoked %d time(s), want %d", index, len(referrerSet))
+	}
+}
+
+func Test_filterReferrers(t *testing.T) {
+	refs := []artifactspec.Descriptor{
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         1,
+			Digest:       digest.FromString("1"),
+			ArtifactType: "application/vnd.test",
+		},
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         2,
+			Digest:       digest.FromString("2"),
+			ArtifactType: "application/vnd.foo",
+		},
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         3,
+			Digest:       digest.FromString("3"),
+			ArtifactType: "application/vnd.bar",
+		},
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         4,
+			Digest:       digest.FromString("4"),
+			ArtifactType: "application/vnd.test",
+		},
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         5,
+			Digest:       digest.FromString("5"),
+			ArtifactType: "application/vnd.baz",
+		},
+	}
+	got := filterReferrers(refs, "application/vnd.test")
+	want := []artifactspec.Descriptor{
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         1,
+			Digest:       digest.FromString("1"),
+			ArtifactType: "application/vnd.test",
+		},
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         4,
+			Digest:       digest.FromString("4"),
+			ArtifactType: "application/vnd.test",
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("filterReferrers() = %v, want %v", got, want)
+	}
+}
+
+func Test_filterReferrers_allMatch(t *testing.T) {
+	refs := []artifactspec.Descriptor{
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         1,
+			Digest:       digest.FromString("1"),
+			ArtifactType: "application/vnd.test",
+		},
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         4,
+			Digest:       digest.FromString("2"),
+			ArtifactType: "application/vnd.test",
+		},
+		{
+			MediaType:    artifactspec.MediaTypeArtifactManifest,
+			Size:         5,
+			Digest:       digest.FromString("3"),
+			ArtifactType: "application/vnd.test",
+		},
+	}
+	got := filterReferrers(refs, "application/vnd.test")
+	if !reflect.DeepEqual(got, refs) {
+		t.Errorf("filterReferrers() = %v, want %v", got, refs)
+	}
+}
+
+func TestRepository_DiscoverExtensions(t *testing.T) {
+	extList := extensions.ExtensionList{
+		Extensions: []extensions.Extension{
+			{
+				Name:        "foo.bar",
+				URL:         "https://example.com",
+				Description: "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+				Endpoints:   []string{"_foo/bar", "_foo/baz"},
+			},
+			{
+				Name:        "cncf.oras.referrers",
+				URL:         "https://github.com/oras-project/artifacts-spec/blob/main/manifest-referrers-api.md",
+				Description: "ORAS referrers listing API",
+				Endpoints:   []string{"_oras/artifacts/referrers"},
+			},
+		},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := "/v2/test/_oci/ext/discover"
+		if r.Method != http.MethodGet || r.URL.Path != path {
+			t.Errorf("unexpected access: %s %q", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(extList); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+	repo, err := NewRepository(uri.Host + "/test")
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repo.PlainHTTP = true
+	ctx := context.Background()
+
+	got, err := repo.DiscoverExtensions(ctx)
+	if err != nil {
+		t.Errorf("Repository.DiscoverExtentions() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, extList.Extensions) {
+		t.Errorf("Repository.DiscoverExtentions(): got %v, want %v", got, extList)
 	}
 }
 
@@ -2470,5 +3165,77 @@ func Test_BlobStore_Push_Port443_HTTPS(t *testing.T) {
 	err = store.Push(ctx, blobDesc, bytes.NewReader(blob))
 	if err != nil {
 		t.Fatalf("Blobs.Push() error = %v", err)
+	}
+}
+
+// Testing `last` parameter for Tags list
+func TestRepository_Tags_WithLastParam(t *testing.T) {
+	tagSet := strings.Split("abcdefghijklmnopqrstuvwxyz", "")
+	var offset int
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v2/test/tags/list" {
+			t.Errorf("unexpected access: %s %s", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		q := r.URL.Query()
+		n, err := strconv.Atoi(q.Get("n"))
+		if err != nil || n != 4 {
+			t.Errorf("bad page size: %s", q.Get("n"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		last := q.Get("last")
+		if last != "" {
+			offset = indexOf(last, tagSet) + 1
+		}
+		var tags []string
+		switch q.Get("test") {
+		case "foo":
+			tags = tagSet[offset : offset+n]
+			offset += n
+			w.Header().Set("Link", fmt.Sprintf(`<%s/v2/test/tags/list?n=4&last=v&test=bar>; rel="next"`, ts.URL))
+		case "bar":
+			tags = tagSet[offset : offset+n]
+		default:
+			tags = tagSet[offset : offset+n]
+			offset += n
+			w.Header().Set("Link", fmt.Sprintf(`<%s/v2/test/tags/list?n=4&last=r&test=foo>; rel="next"`, ts.URL))
+		}
+		result := struct {
+			Tags []string `json:"tags"`
+		}{
+			Tags: tags,
+		}
+		if err := json.NewEncoder(w).Encode(result); err != nil {
+			t.Errorf("failed to write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+	uri, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("invalid test http server: %v", err)
+	}
+
+	repo, err := NewRepository(uri.Host + "/test")
+	if err != nil {
+		t.Fatalf("NewRepository() error = %v", err)
+	}
+	repo.PlainHTTP = true
+	repo.TagListPageSize = 4
+	last := "n"
+	startInd := indexOf(last, tagSet) + 1
+
+	ctx := context.Background()
+	if err := repo.Tags(ctx, last, func(got []string) error {
+		want := tagSet[startInd : startInd+repo.TagListPageSize]
+		startInd += repo.TagListPageSize
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Registry.Repositories() = %v, want %v", got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("Repository.Tags() error = %v", err)
 	}
 }

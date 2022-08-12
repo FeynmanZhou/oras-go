@@ -13,11 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package docker
+// Package doc provides the constant can be used in example test files. Most of
+// the example tests in this repo are fail to run on the GoDoc website because
+// of the missing variables. In order to avoid confusing users, these tests
+// should be unplayable on the GoDoc website, and this can be achieved by
+// leveraging a dot import in the test files.
+// Reference: https://pkg.go.dev/go/doc#Example
+package doc
 
-// docker media types
-const (
-	MediaTypeConfig       = "application/vnd.docker.container.image.v1+json"
-	MediaTypeManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
-	MediaTypeManifest     = "application/vnd.docker.distribution.manifest.v2+json"
-)
+// ExampleUnplayable is used in examples test files in order to make example
+// tests unplayable.
+const ExampleUnplayable = true
